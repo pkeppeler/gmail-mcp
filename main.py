@@ -1,5 +1,5 @@
 def main():
-    print("Hello from gmail-mcp!")
+    print("Hello World from gmail-mcp!")
 
 
 if __name__ == "__main__":
