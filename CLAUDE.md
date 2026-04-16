@@ -142,9 +142,16 @@ All bulk tools paginate internally. Gmail batch limit is 100 messages per reques
 - **Batch limit**: 100 messages per Gmail batch request. Bulk operations loop with pagination.
 - **Error format**: include Gmail API error message and HTTP status in tool error responses.
 
+## Type Safety
+
+- **Pydantic models everywhere** — use Pydantic `BaseModel` subclasses for tool inputs, tool outputs, Gmail API response shapes, and internal data structures. No raw dicts.
+- **Strict type checking** — pyright in strict mode (`typeCheckingMode = "strict"` in `pyproject.toml`). All code must pass with zero errors.
+- **CI enforcement** — GitHub Actions runs `uv run pyright` on every PR and push to main. PRs that fail type checking cannot merge.
+- **Editor feedback** — Pylance (VS Code) provides real-time type checking using the same pyright config. No separate pre-commit hook.
+
 ## Code Style
 
 - Straightforward, well-commented. This is a learning project.
 - Keep JSON-RPC protocol mechanics visible in `server.py`. No meta-programming or magic dispatch.
-- `gmail_client.py` returns clean Python dicts. Tools should not import `googleapiclient` directly.
-- Tool handlers are plain functions that take an arguments dict and return a result dict.
+- `gmail_client.py` returns clean Pydantic models. Tools should not import `googleapiclient` directly.
+- Tool handlers are plain functions that take a Pydantic model and return a Pydantic model.
