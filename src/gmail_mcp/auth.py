@@ -23,9 +23,17 @@ import os
 import sys
 from pathlib import Path
 
+import httplib2  # type: ignore[import-untyped]
 from google.auth.transport.requests import Request  # type: ignore[import-untyped]
 from google.oauth2.credentials import Credentials  # type: ignore[import-untyped]
 from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore[import-untyped]
+
+# httplib2 ships its own CA bundle and ignores SSL_CERT_FILE / REQUESTS_CA_BUNDLE.
+# In proxied environments (e.g. Claude Code web) the system bundle includes the
+# proxy's CA cert, so we point httplib2 at it when the env var is set.
+_system_ca = os.environ.get("SSL_CERT_FILE")
+if _system_ca and Path(_system_ca).exists():
+    httplib2.CA_CERTS = _system_ca
 from googleapiclient.discovery import build  # type: ignore[import-untyped]
 from googleapiclient.discovery import Resource  # type: ignore[import-untyped]
 
