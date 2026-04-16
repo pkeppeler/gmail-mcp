@@ -45,7 +45,7 @@ Build a local Gmail MCP server in Python to learn MCP internals hands-on, and to
 - `config/` directory
 - `.gitignore` covering `config/token.json`, `config/credentials.json`, `__pycache__`, `.venv`, `*.egg-info`
 
-**Done when**: `pip install -e .` succeeds and `python -c "import gmail_mcp"` doesn't error.
+**Done when**: `uv sync` succeeds and `uv run python -c "import gmail_mcp"` doesn't error.
 
 **Learning**: nothing new. Just getting the project bootable.
 
@@ -211,7 +211,7 @@ Test scenarios:
 ## Phase 11: SDK Refactor
 **What**: replace `server.py` with the `mcp` Python SDK. Everything else stays the same.
 
-- `pip install mcp`
+- `uv add mcp`
 - Rewrite `server.py` to use `@server.tool()` decorators and the SDK's stdio transport
 - All tool implementations in `tools/` remain unchanged
 - The diff should be confined to `server.py` and `pyproject.toml`
