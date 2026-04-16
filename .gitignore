@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# OAuth credentials and tokens
+config/credentials.json
+config/token.json
