@@ -13,7 +13,7 @@ gmail-mcp-server/
 │       ├── __init__.py
 │       ├── server.py          # JSON-RPC 2.0 dispatcher, MCP method handlers
 │       ├── auth.py            # OAuth 2.0 flow, token persistence, auto-refresh
-│       ├── gmail_client.py    # Thin wrapper around Gmail API, returns clean dicts
+│       ├── gmail_client.py    # Thin wrapper around Gmail API, returns Pydantic models
 │       └── tools/
 │           ├── __init__.py
 │           ├── messages.py    # gmail_search, gmail_read, gmail_list_labels, gmail_modify_labels, gmail_archive, gmail_trash, gmail_delete
