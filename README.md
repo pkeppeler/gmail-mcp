@@ -103,6 +103,11 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the phased implementation plan covering GCP setup through SDK migration.
 
+## References
+
+- [Model Context Protocol Specification](https://modelcontextprotocol.io/specification/2025-03-26)
+- [MCP GitHub Organization](https://github.com/modelcontextprotocol)
+
 ## License
 
 MIT
