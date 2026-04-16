@@ -75,7 +75,7 @@ Open `config/credentials.json` and confirm it has `installed.client_id`, `instal
 
 ---
 
-## Phase 1: Project Scaffolding
+## Phase 1: Project Scaffolding ✅
 **What**: directory structure, dependency config, gitignore. Pure boilerplate.
 
 - `pyproject.toml` with dependencies
