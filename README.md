@@ -16,9 +16,27 @@ Built as a learning project to understand MCP internals hands-on — the raw JSO
 
 - Python 3.14+
 - [uv](https://docs.astral.sh/uv/) for dependency management
-- A Google Cloud project with the Gmail API enabled and OAuth Desktop App credentials (see [Project Plan](PROJECT_PLAN.md#phase-0-gcp-setup) for setup steps)
+- A Google account (Gmail)
 
-## Setup
+## Google Cloud Setup
+
+You need a Google Cloud project with the Gmail API enabled and OAuth credentials. This takes about 5 minutes.
+
+1. **Create a project** — Go to [Create a New Project](https://console.cloud.google.com/projectcreate), name it `gmail-mcp-server`, and click **Create**
+
+2. **Enable the Gmail API** — Open the [Gmail API page](https://console.cloud.google.com/apis/library/gmail.googleapis.com) (select your new project in the top-left dropdown), then click **Enable**
+
+3. **Configure OAuth consent** — Go to [Google Auth Platform](https://console.cloud.google.com/auth/overview), click **Get Started**, set app name to `Gmail MCP Server` with your email, select user type **External**, and click **Create**
+
+4. **Add API scopes** — Go to [Data Access](https://console.cloud.google.com/auth/scopes) in the sidebar, click **Add or Remove Scopes**, filter by "Gmail API", and select `gmail.modify` and `gmail.settings.basic`
+
+5. **Add test user** — Go to [Audience](https://console.cloud.google.com/auth/audience) in the sidebar, click **Add Users**, and add your Gmail address
+
+6. **Create credentials** — Go to [Clients](https://console.cloud.google.com/auth/clients) in the sidebar, click **Create Client**, select **Desktop app**, click **Create**, then **Download JSON**. Save the file as `config/credentials.json` in this project
+
+> For more detail on any step, see [PROJECT_PLAN.md — Phase 0](PROJECT_PLAN.md#phase-0-gcp-setup).
+
+## Install and Run
 
 ```bash
 # Clone and install
@@ -26,9 +44,9 @@ git clone https://github.com/pkeppeler/gmail-mcp.git
 cd gmail-mcp
 uv sync
 
-# Add your OAuth credentials
+# Add your OAuth credentials (downloaded above)
 mkdir -p config
-cp /path/to/downloaded/credentials.json config/credentials.json
+cp ~/Downloads/client_secret_*.json config/credentials.json
 
 # First run will open a browser for OAuth consent
 uv run python -m gmail_mcp.server
