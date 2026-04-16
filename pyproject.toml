@@ -1,10 +1,19 @@
 [project]
 name = "gmail-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local Gmail MCP server. Raw JSON-RPC 2.0 over stdio."
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "google-auth>=2.38",
+    "google-auth-oauthlib>=1.2",
+    "google-api-python-client>=2.166",
+    "pydantic>=2.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
