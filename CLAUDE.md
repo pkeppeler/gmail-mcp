@@ -33,6 +33,10 @@ gmail-mcp-server/
 
 - `GMAIL_MCP_CREDENTIALS` — path to OAuth client_secret JSON (default: `./config/credentials.json`)
 - `GMAIL_MCP_TOKEN` — path to stored OAuth token (default: `./config/token.json`)
+- `GMAIL_MCP_CREDENTIALS_JSON` — raw JSON content of the OAuth client-secret file (for remote/CI envs)
+- `GMAIL_MCP_TOKEN_JSON` — raw JSON content of the stored OAuth token file (for remote/CI envs)
+
+When the `_JSON` variants are set, `auth.py` materializes them to disk at the configured file paths on startup. This is the preferred way to pass secrets in remote Claude Code sessions.
 
 ## Protocol: JSON-RPC 2.0 over stdio
 
