@@ -4,9 +4,17 @@ First run:  opens a browser for user consent, exchanges the authorization code
             for access + refresh tokens, and persists them to disk.
 Subsequent: loads the stored token and auto-refreshes if expired.
 
-Environment variables:
+Environment variables (file paths):
     GMAIL_MCP_CREDENTIALS  path to OAuth client-secret JSON  (default: ./config/credentials.json)
     GMAIL_MCP_TOKEN        path to stored OAuth token JSON    (default: ./config/token.json)
+
+Environment variables (inline JSON — for remote/CI environments):
+    GMAIL_MCP_CREDENTIALS_JSON  raw JSON content of the OAuth client-secret file
+    GMAIL_MCP_TOKEN_JSON        raw JSON content of the stored OAuth token file
+
+    When the _JSON variants are set, auth.py materializes them to disk at the
+    configured file paths on startup. This lets you pass secrets via env vars
+    (e.g. in Claude Code web sessions) without manually creating config files.
 """
 
 import json
@@ -15,9 +23,17 @@ import os
 import sys
 from pathlib import Path
 
+import httplib2  # type: ignore[import-untyped]
 from google.auth.transport.requests import Request  # type: ignore[import-untyped]
 from google.oauth2.credentials import Credentials  # type: ignore[import-untyped]
 from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore[import-untyped]
+
+# httplib2 ships its own CA bundle and ignores SSL_CERT_FILE / REQUESTS_CA_BUNDLE.
+# In proxied environments (e.g. Claude Code web) the system bundle includes the
+# proxy's CA cert, so we point httplib2 at it when the env var is set.
+_system_ca = os.environ.get("SSL_CERT_FILE")
+if _system_ca and Path(_system_ca).exists():
+    httplib2.CA_CERTS = _system_ca
 from googleapiclient.discovery import build  # type: ignore[import-untyped]
 from googleapiclient.discovery import Resource  # type: ignore[import-untyped]
 
@@ -42,6 +58,25 @@ def _credentials_path() -> Path:
 def _token_path() -> Path:
     """Return the path to the stored OAuth token JSON file."""
     return Path(os.environ.get("GMAIL_MCP_TOKEN", _DEFAULT_TOKEN_PATH))
+
+
+def _materialize_env_secrets() -> None:
+    """Write inline JSON env vars to disk so the rest of auth.py can read files as normal.
+
+    Checks GMAIL_MCP_CREDENTIALS_JSON and GMAIL_MCP_TOKEN_JSON.  If set,
+    writes their contents to the configured file paths, creating parent
+    directories as needed.  Runs once at the start of get_credentials().
+    """
+    for env_var, path_fn in [
+        ("GMAIL_MCP_CREDENTIALS_JSON", _credentials_path),
+        ("GMAIL_MCP_TOKEN_JSON", _token_path),
+    ]:
+        raw = os.environ.get(env_var)
+        if raw:
+            path = path_fn()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw)
+            log.info("Materialized %s → %s", env_var, path)
 
 
 def _load_stored_token() -> Credentials | None:
@@ -103,6 +138,8 @@ def get_credentials() -> Credentials:
         3. If no token exists (or refresh fails), run the full browser flow.
         4. Persist the resulting token to disk.
     """
+    _materialize_env_secrets()
+
     creds = _load_stored_token()
 
     if creds is not None and creds.valid:  # pyright: ignore[reportUnknownMemberType]
