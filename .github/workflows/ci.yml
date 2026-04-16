@@ -13,6 +13,8 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
+      - run: uv lock --check
+
       - run: uv sync --dev
 
       - run: uv run pyright
