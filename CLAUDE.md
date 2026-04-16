@@ -2,6 +2,10 @@
 
 Local Gmail MCP server. Raw JSON-RPC 2.0 over stdio. Python.
 
+## Project Plan
+
+See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the phased implementation plan (Phases 0–11). Reference it when starting a new phase, deciding what to build next, or checking "done when" criteria for the current phase.
+
 ## Project Structure
 
 ```
