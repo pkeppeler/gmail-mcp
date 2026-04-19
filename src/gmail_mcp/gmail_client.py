@@ -29,30 +29,80 @@ _RETRY_DELAYS = [1.0, 2.0, 4.0]
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 
 
-def _execute_batch_with_retries(batch: Any) -> None:
-    """Execute a BatchHttpRequest with exponential backoff on transport errors.
-
-    BatchHttpRequest.execute() doesn't support num_retries. This retries
-    when the entire HTTP transport fails (DNS errors, connection resets).
-    Per-request errors (429, 5xx) are handled separately via callbacks.
-    """
-    for attempt, delay in enumerate(_RETRY_DELAYS):
-        try:
-            batch.execute()
-            return
-        except Exception as exc:
-            if attempt == len(_RETRY_DELAYS) - 1:
-                raise
-            log.warning("Batch transport failed (attempt %d), retrying in %.0fs: %s", attempt + 1, delay, exc)
-            time.sleep(delay)
-    batch.execute()
-
-
 def _is_retryable(exc: Exception) -> bool:
     """Return True if an individual batch response error is worth retrying."""
     if isinstance(exc, HttpError):
         return exc.status_code in _RETRYABLE_STATUS_CODES  # pyright: ignore[reportUnknownMemberType]
     return False
+
+
+def _run_batch(
+    svc: Any,
+    request_ids: list[str],
+    build_request: Any,
+) -> dict[str, dict[str, Any]]:
+    """Execute requests in batches of 100 with two-layer retry.
+
+    Layer 1: retries the entire HTTP call on transport failures (DNS, etc.).
+    Layer 2: re-submits individual requests that got retryable errors (429, 5xx).
+
+    Args:
+        svc: the Gmail API service object (for new_batch_http_request).
+        request_ids: list of IDs to process.
+        build_request: callable(id) -> HttpRequest for each ID.
+
+    Returns:
+        dict mapping request_id -> response dict for successful requests.
+    """
+    results: dict[str, dict[str, Any]] = {}
+
+    for chunk_start in range(0, len(request_ids), _BATCH_SIZE):
+        chunk = request_ids[chunk_start : chunk_start + _BATCH_SIZE]
+        pending = list(chunk)
+
+        for attempt, delay in enumerate([0.0, *_RETRY_DELAYS]):
+            if attempt > 0:
+                time.sleep(delay)
+                log.info("Retrying %d failed requests (attempt %d)", len(pending), attempt + 1)
+
+            failed: dict[str, Exception] = {}
+
+            def _callback(
+                request_id: str,
+                response: dict[str, Any],
+                exception: Exception | None,
+                _failed: dict[str, Exception] = failed,
+                _results: dict[str, dict[str, Any]] = results,
+            ) -> None:
+                if exception is not None:
+                    _failed[request_id] = exception
+                else:
+                    _results[request_id] = response
+
+            batch = svc.new_batch_http_request(callback=_callback)
+            for rid in pending:
+                batch.add(build_request(rid), request_id=rid)
+
+            # Layer 1: retry transport failures.
+            for transport_attempt, transport_delay in enumerate(_RETRY_DELAYS):
+                try:
+                    batch.execute()
+                    break
+                except Exception as exc:
+                    if transport_attempt == len(_RETRY_DELAYS) - 1:
+                        raise
+                    log.warning("Batch transport failed (attempt %d), retrying in %.0fs: %s", transport_attempt + 1, transport_delay, exc)
+                    time.sleep(transport_delay)
+
+            # Layer 2: collect retryable per-request failures.
+            pending = [rid for rid, exc in failed.items() if _is_retryable(exc)]
+            for rid, exc in failed.items():
+                if not _is_retryable(exc):
+                    log.warning("Non-retryable error for %s: %s", rid, exc)
+            if not pending:
+                break
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -250,51 +300,17 @@ class GmailClient:
             if page_token is None:
                 break
 
-        # Fetch metadata in batches of 100, retrying transient per-request errors.
-        raw_messages: dict[str, dict[str, Any]] = {}
-        for batch_start in range(0, len(message_ids), _BATCH_SIZE):
-            batch_ids = message_ids[batch_start : batch_start + _BATCH_SIZE]
-            pending = list(batch_ids)
-
-            for attempt, delay in enumerate([0.0, *_RETRY_DELAYS]):
-                if attempt > 0:
-                    time.sleep(delay)
-                    log.info("Retrying %d failed message fetches (attempt %d)", len(pending), attempt + 1)
-
-                failed: dict[str, Exception] = {}
-
-                def _on_message(
-                    request_id: str,
-                    response: dict[str, Any],
-                    exception: Exception | None,
-                    _failed: dict[str, Exception] = failed,
-                    _results: dict[str, dict[str, Any]] = raw_messages,
-                ) -> None:
-                    if exception is not None:
-                        _failed[request_id] = exception
-                    else:
-                        _results[request_id] = response
-
-                batch = self._svc.new_batch_http_request(callback=_on_message)
-                for mid in pending:
-                    batch.add(
-                        self._svc.users().messages().get(
-                            userId="me",
-                            id=mid,
-                            format="metadata",
-                            metadataHeaders=["Subject", "From", "Date"],
-                        ),
-                        request_id=mid,
-                    )
-                _execute_batch_with_retries(batch)
-
-                # Collect retryable failures for the next round.
-                pending = [mid for mid, exc in failed.items() if _is_retryable(exc)]
-                for mid, exc in failed.items():
-                    if not _is_retryable(exc):
-                        log.warning("Non-retryable error for %s: %s", mid, exc)
-                if not pending:
-                    break
+        # Fetch metadata in batches of 100 with per-request retry.
+        raw_messages = _run_batch(
+            self._svc,
+            message_ids,
+            lambda mid: self._svc.users().messages().get(  # pyright: ignore[reportUnknownLambdaType]
+                userId="me",
+                id=mid,
+                format="metadata",
+                metadataHeaders=["Subject", "From", "Date"],
+            ),
+        )
 
         # Build summaries in the original ID order.
         summaries: list[MessageSummary] = []
