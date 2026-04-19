@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from googleapiclient.discovery import Resource  # type: ignore[import-untyped]  # noqa: F401
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ class Label(BaseModel):
 
     id: str
     name: str
-    type: str  # "system" or "user"
+    type: str = "user"
 
 
 class MessageSummary(BaseModel):
@@ -66,17 +66,25 @@ class Message(BaseModel):
 class FilterCriteria(BaseModel):
     """Human-readable filter criteria."""
 
-    from_: str | None = None
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str | None = Field(None, alias="from")
     to: str | None = None
     subject: str | None = None
     query: str | None = None
-    has_attachment: bool | None = None
+    has_attachment: bool | None = Field(None, alias="hasAttachment")
     size: int | None = None
-    size_comparison: str | None = None  # "larger" or "smaller"
+    size_comparison: str | None = Field(None, alias="sizeComparison")
 
 
 class FilterAction(BaseModel):
-    """Human-readable filter action."""
+    """Human-readable filter action.
+
+    add_labels/remove_labels store human-readable names, not raw label IDs.
+    The alias fields (neverSpam, etc.) allow model_validate from API dicts.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     add_labels: list[str] = []
     remove_labels: list[str] = []
@@ -85,8 +93,8 @@ class FilterAction(BaseModel):
     star: bool | None = None
     forward: str | None = None
     delete: bool | None = None
-    never_spam: bool | None = None
-    never_important: bool | None = None
+    never_spam: bool | None = Field(None, alias="neverSpam")
+    never_important: bool | None = Field(None, alias="neverMarkAsImportant")
 
 
 class Filter(BaseModel):
@@ -137,10 +145,7 @@ class GmailClient:
             .execute(num_retries=_RETRIES)
         )
         raw_labels: list[dict[str, Any]] = resp.get("labels", [])
-        labels = [
-            Label(id=l["id"], name=l["name"], type=l.get("type", "user"))
-            for l in raw_labels
-        ]
+        labels = [Label.model_validate(l) for l in raw_labels]
         # Rebuild caches.
         self._label_cache = {lb.id: lb for lb in labels}
         self._label_name_to_id = {lb.name: lb.id for lb in labels}
@@ -365,69 +370,43 @@ class GmailClient:
 
     def _parse_filter(self, raw: dict[str, Any]) -> Filter:
         """Convert a raw API filter dict into a Filter model."""
-        criteria = raw.get("criteria", {})
-        action = raw.get("action", {})
-        return Filter(
-            id=raw["id"],
-            criteria=FilterCriteria(
-                from_=criteria.get("from"),
-                to=criteria.get("to"),
-                subject=criteria.get("subject"),
-                query=criteria.get("query"),
-                has_attachment=criteria.get("hasAttachment"),
-                size=criteria.get("size"),
-                size_comparison=criteria.get("sizeComparison"),
-            ),
-            action=FilterAction(
-                add_labels=[
-                    self.resolve_label_name(lid)
-                    for lid in action.get("addLabelIds", [])
-                ],
-                remove_labels=[
-                    self.resolve_label_name(lid)
-                    for lid in action.get("removeLabelIds", [])
-                ],
-                archive="INBOX" in action.get("removeLabelIds", []),
-                mark_read="UNREAD" in action.get("removeLabelIds", []),
-                star="STARRED" in action.get("addLabelIds", []),
-                forward=action.get("forward"),
-                delete=None,
-                never_spam=action.get("neverSpam"),
-                never_important=action.get("neverMarkAsImportant"),
-            ),
+        criteria = FilterCriteria.model_validate(raw.get("criteria", {}))
+
+        raw_action: dict[str, Any] = raw.get("action", {})
+        add_label_ids: list[str] = raw_action.get("addLabelIds", [])
+        remove_label_ids: list[str] = raw_action.get("removeLabelIds", [])
+
+        action = FilterAction.model_validate(
+            {
+                **raw_action,
+                "add_labels": [self.resolve_label_name(lid) for lid in add_label_ids],
+                "remove_labels": [self.resolve_label_name(lid) for lid in remove_label_ids],
+                "archive": "INBOX" in remove_label_ids,
+                "mark_read": "UNREAD" in remove_label_ids,
+                "star": "STARRED" in add_label_ids,
+            }
         )
+
+        return Filter(id=raw["id"], criteria=criteria, action=action)
 
     def _criteria_to_api(self, c: FilterCriteria) -> dict[str, Any]:
         """Convert FilterCriteria to the Gmail API format."""
-        d: dict[str, Any] = {}
-        if c.from_ is not None:
-            d["from"] = c.from_
-        if c.to is not None:
-            d["to"] = c.to
-        if c.subject is not None:
-            d["subject"] = c.subject
-        if c.query is not None:
-            d["query"] = c.query
-        if c.has_attachment is not None:
-            d["hasAttachment"] = c.has_attachment
-        if c.size is not None:
-            d["size"] = c.size
-        if c.size_comparison is not None:
-            d["sizeComparison"] = c.size_comparison
-        return d
+        return c.model_dump(by_alias=True, exclude_none=True)
 
     def _action_to_api(self, a: FilterAction) -> dict[str, Any]:
         """Convert FilterAction to the Gmail API format."""
-        d: dict[str, Any] = {}
-        add_ids: list[str] = []
-        remove_ids: list[str] = []
+        # Scalar fields (forward, neverSpam, neverMarkAsImportant) via model_dump.
+        d = a.model_dump(
+            by_alias=True,
+            exclude_none=True,
+            exclude={"add_labels", "remove_labels", "archive", "mark_read", "star", "delete"},
+        )
 
-        if a.add_labels:
-            add_ids.extend(self.resolve_label_id(n) for n in a.add_labels)
+        # Label fields need ID resolution + special-label merging.
+        add_ids: list[str] = [self.resolve_label_id(n) for n in a.add_labels]
+        remove_ids: list[str] = [self.resolve_label_id(n) for n in a.remove_labels]
         if a.star:
             add_ids.append("STARRED")
-        if a.remove_labels:
-            remove_ids.extend(self.resolve_label_id(n) for n in a.remove_labels)
         if a.archive:
             remove_ids.append("INBOX")
         if a.mark_read:
@@ -437,12 +416,6 @@ class GmailClient:
             d["addLabelIds"] = add_ids
         if remove_ids:
             d["removeLabelIds"] = remove_ids
-        if a.forward is not None:
-            d["forward"] = a.forward
-        if a.never_spam is not None:
-            d["neverSpam"] = a.never_spam
-        if a.never_important is not None:
-            d["neverMarkAsImportant"] = a.never_important
         return d
 
 
