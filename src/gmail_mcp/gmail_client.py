@@ -12,6 +12,7 @@ import base64
 import html as html_mod
 import logging
 import re
+import time
 from typing import Any
 
 from googleapiclient.discovery import Resource  # type: ignore[import-untyped]  # noqa: F401
@@ -23,6 +24,24 @@ log = logging.getLogger(__name__)
 # transient HTTP errors (429, 5xx) with built-in exponential backoff.
 _RETRIES = 3
 _BATCH_SIZE = 100
+_BATCH_RETRY_DELAYS = [1.0, 2.0, 4.0]  # exponential backoff for batch execute
+
+
+def _execute_batch_with_retries(batch: Any) -> None:
+    """Execute a BatchHttpRequest with exponential backoff on transient errors.
+
+    BatchHttpRequest.execute() doesn't support num_retries, so we wrap it.
+    """
+    for attempt, delay in enumerate(_BATCH_RETRY_DELAYS):
+        try:
+            batch.execute()
+            return
+        except Exception as exc:
+            if attempt == len(_BATCH_RETRY_DELAYS) - 1:
+                raise
+            log.warning("Batch request failed (attempt %d), retrying in %.0fs: %s", attempt + 1, delay, exc)
+            time.sleep(delay)
+    batch.execute()
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +262,7 @@ class GmailClient:
                     ),
                     request_id=mid,
                 )
-            batch.execute()
+            _execute_batch_with_retries(batch)
 
             # Build summaries in the original ID order.
             for mid in batch_ids:
