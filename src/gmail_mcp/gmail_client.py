@@ -78,8 +78,8 @@ class FilterCriteria(BaseModel):
 class FilterAction(BaseModel):
     """Human-readable filter action."""
 
-    add_labels: list[str] | None = None
-    remove_labels: list[str] | None = None
+    add_labels: list[str] = []
+    remove_labels: list[str] = []
     archive: bool | None = None
     mark_read: bool | None = None
     star: bool | None = None
