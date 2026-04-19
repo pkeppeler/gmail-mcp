@@ -16,6 +16,7 @@ import time
 from typing import Any
 
 from googleapiclient.discovery import Resource  # type: ignore[import-untyped]  # noqa: F401
+from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field
 
 log = logging.getLogger(__name__)
@@ -24,24 +25,34 @@ log = logging.getLogger(__name__)
 # transient HTTP errors (429, 5xx) with built-in exponential backoff.
 _RETRIES = 3
 _BATCH_SIZE = 100
-_BATCH_RETRY_DELAYS = [1.0, 2.0, 4.0]  # exponential backoff for batch execute
+_RETRY_DELAYS = [1.0, 2.0, 4.0]
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 
 
 def _execute_batch_with_retries(batch: Any) -> None:
-    """Execute a BatchHttpRequest with exponential backoff on transient errors.
+    """Execute a BatchHttpRequest with exponential backoff on transport errors.
 
-    BatchHttpRequest.execute() doesn't support num_retries, so we wrap it.
+    BatchHttpRequest.execute() doesn't support num_retries. This retries
+    when the entire HTTP transport fails (DNS errors, connection resets).
+    Per-request errors (429, 5xx) are handled separately via callbacks.
     """
-    for attempt, delay in enumerate(_BATCH_RETRY_DELAYS):
+    for attempt, delay in enumerate(_RETRY_DELAYS):
         try:
             batch.execute()
             return
         except Exception as exc:
-            if attempt == len(_BATCH_RETRY_DELAYS) - 1:
+            if attempt == len(_RETRY_DELAYS) - 1:
                 raise
-            log.warning("Batch request failed (attempt %d), retrying in %.0fs: %s", attempt + 1, delay, exc)
+            log.warning("Batch transport failed (attempt %d), retrying in %.0fs: %s", attempt + 1, delay, exc)
             time.sleep(delay)
     batch.execute()
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return True if an individual batch response error is worth retrying."""
+    if isinstance(exc, HttpError):
+        return exc.status_code in _RETRYABLE_STATUS_CODES  # pyright: ignore[reportUnknownMemberType]
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -239,49 +250,71 @@ class GmailClient:
             if page_token is None:
                 break
 
-        # Fetch metadata in batches of 100.
-        summaries: list[MessageSummary] = []
+        # Fetch metadata in batches of 100, retrying transient per-request errors.
+        raw_messages: dict[str, dict[str, Any]] = {}
         for batch_start in range(0, len(message_ids), _BATCH_SIZE):
             batch_ids = message_ids[batch_start : batch_start + _BATCH_SIZE]
-            raw_messages: dict[str, dict[str, Any]] = {}
+            pending = list(batch_ids)
 
-            def _on_message(request_id: str, response: dict[str, Any], exception: Exception | None) -> None:
-                if exception is not None:
-                    log.warning("Batch get failed for %s: %s", request_id, exception)
-                    return
-                raw_messages[request_id] = response
+            for attempt, delay in enumerate([0.0, *_RETRY_DELAYS]):
+                if attempt > 0:
+                    time.sleep(delay)
+                    log.info("Retrying %d failed message fetches (attempt %d)", len(pending), attempt + 1)
 
-            batch = self._svc.new_batch_http_request(callback=_on_message)
-            for mid in batch_ids:
-                batch.add(
-                    self._svc.users().messages().get(
-                        userId="me",
-                        id=mid,
-                        format="metadata",
-                        metadataHeaders=["Subject", "From", "Date"],
-                    ),
-                    request_id=mid,
-                )
-            _execute_batch_with_retries(batch)
+                failed: dict[str, Exception] = {}
 
-            # Build summaries in the original ID order.
-            for mid in batch_ids:
-                raw = raw_messages.get(mid)
-                if raw is None:
-                    continue
-                headers = _headers_dict(raw)
-                label_ids: list[str] = raw.get("labelIds", [])
-                summaries.append(
-                    MessageSummary(
-                        id=raw["id"],
-                        thread_id=raw["threadId"],
-                        subject=headers.get("Subject", "(no subject)"),
-                        sender=headers.get("From", ""),
-                        date=headers.get("Date", ""),
-                        snippet=raw.get("snippet", ""),
-                        labels=[self.resolve_label_name(lid) for lid in label_ids],
+                def _on_message(
+                    request_id: str,
+                    response: dict[str, Any],
+                    exception: Exception | None,
+                    _failed: dict[str, Exception] = failed,
+                    _results: dict[str, dict[str, Any]] = raw_messages,
+                ) -> None:
+                    if exception is not None:
+                        _failed[request_id] = exception
+                    else:
+                        _results[request_id] = response
+
+                batch = self._svc.new_batch_http_request(callback=_on_message)
+                for mid in pending:
+                    batch.add(
+                        self._svc.users().messages().get(
+                            userId="me",
+                            id=mid,
+                            format="metadata",
+                            metadataHeaders=["Subject", "From", "Date"],
+                        ),
+                        request_id=mid,
                     )
+                _execute_batch_with_retries(batch)
+
+                # Collect retryable failures for the next round.
+                pending = [mid for mid, exc in failed.items() if _is_retryable(exc)]
+                for mid, exc in failed.items():
+                    if not _is_retryable(exc):
+                        log.warning("Non-retryable error for %s: %s", mid, exc)
+                if not pending:
+                    break
+
+        # Build summaries in the original ID order.
+        summaries: list[MessageSummary] = []
+        for mid in message_ids:
+            raw = raw_messages.get(mid)
+            if raw is None:
+                continue
+            headers = _headers_dict(raw)
+            label_ids: list[str] = raw.get("labelIds", [])
+            summaries.append(
+                MessageSummary(
+                    id=raw["id"],
+                    thread_id=raw["threadId"],
+                    subject=headers.get("Subject", "(no subject)"),
+                    sender=headers.get("From", ""),
+                    date=headers.get("Date", ""),
+                    snippet=raw.get("snippet", ""),
+                    labels=[self.resolve_label_name(lid) for lid in label_ids],
                 )
+            )
         return summaries
 
     def get_message(self, message_id: str) -> Message:
