@@ -1,0 +1,5 @@
+{
+  "python.analysis.typeCheckingMode": "strict",
+  "python.analysis.importFormat": "absolute",
+  "python.analysis.autoImportCompletions": true
+}
