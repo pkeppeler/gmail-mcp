@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 # Every .execute() call passes this so the google-api-python-client retries
 # transient HTTP errors (429, 5xx) with built-in exponential backoff.
 _RETRIES = 3
+_BATCH_SIZE = 100
 
 
 # ---------------------------------------------------------------------------
@@ -219,32 +220,49 @@ class GmailClient:
             if page_token is None:
                 break
 
-        # Fetch metadata for each message.
+        # Fetch metadata in batches of 100.
         summaries: list[MessageSummary] = []
-        for mid in message_ids:
-            raw: dict[str, Any] = (
-                self._svc.users()                .messages()
-                .get(
-                    userId="me",
-                    id=mid,
-                    format="metadata",
-                    metadataHeaders=["Subject", "From", "Date"],
+        for batch_start in range(0, len(message_ids), _BATCH_SIZE):
+            batch_ids = message_ids[batch_start : batch_start + _BATCH_SIZE]
+            raw_messages: dict[str, dict[str, Any]] = {}
+
+            def _on_message(request_id: str, response: dict[str, Any], exception: Exception | None) -> None:
+                if exception is not None:
+                    log.warning("Batch get failed for %s: %s", request_id, exception)
+                    return
+                raw_messages[request_id] = response
+
+            batch = self._svc.new_batch_http_request(callback=_on_message)
+            for mid in batch_ids:
+                batch.add(
+                    self._svc.users().messages().get(
+                        userId="me",
+                        id=mid,
+                        format="metadata",
+                        metadataHeaders=["Subject", "From", "Date"],
+                    ),
+                    request_id=mid,
                 )
-                .execute(num_retries=_RETRIES)
-            )
-            headers = _headers_dict(raw)
-            label_ids: list[str] = raw.get("labelIds", [])
-            summaries.append(
-                MessageSummary(
-                    id=raw["id"],
-                    thread_id=raw["threadId"],
-                    subject=headers.get("Subject", "(no subject)"),
-                    sender=headers.get("From", ""),
-                    date=headers.get("Date", ""),
-                    snippet=raw.get("snippet", ""),
-                    labels=[self.resolve_label_name(lid) for lid in label_ids],
+            batch.execute()
+
+            # Build summaries in the original ID order.
+            for mid in batch_ids:
+                raw = raw_messages.get(mid)
+                if raw is None:
+                    continue
+                headers = _headers_dict(raw)
+                label_ids: list[str] = raw.get("labelIds", [])
+                summaries.append(
+                    MessageSummary(
+                        id=raw["id"],
+                        thread_id=raw["threadId"],
+                        subject=headers.get("Subject", "(no subject)"),
+                        sender=headers.get("From", ""),
+                        date=headers.get("Date", ""),
+                        snippet=raw.get("snippet", ""),
+                        labels=[self.resolve_label_name(lid) for lid in label_ids],
+                    )
                 )
-            )
         return summaries
 
     def get_message(self, message_id: str) -> Message:
