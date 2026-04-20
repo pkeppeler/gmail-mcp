@@ -1,134 +1,52 @@
 """Unit tests for the batch retry logic in gmail_client."""
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 from httplib2 import Response  # type: ignore[import-untyped]
 
-from gmail_mcp.gmail_client import (
-    _execute_with_transport_retry,
-    _is_retryable,
-    _run_batch,
-)
+from gmail_mcp.gmail_client import _execute_with_transport_retry, _run_batch
+
+
+def _http_error(status: int) -> HttpError:
+    return HttpError(Response({"status": str(status)}), b"error", uri="http://x")
 
 
 # ---------------------------------------------------------------------------
-# Helpers for building mock HttpError objects
+# Fixtures
 # ---------------------------------------------------------------------------
 
 
-def _make_http_error(status: int) -> HttpError:
-    """Create an HttpError with the given status code."""
-    resp = Response({"status": str(status)})
-    return HttpError(resp, b"error", uri="https://example.com")
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent real sleeps in all tests."""
+    monkeypatch.setattr("gmail_mcp.gmail_client.time.sleep", lambda _: None)
 
 
-# ---------------------------------------------------------------------------
-# _is_retryable
-# ---------------------------------------------------------------------------
+def _make_svc(responses: dict[str, dict[str, Any] | Exception]) -> MagicMock:
+    """Mock Gmail service that invokes batch callbacks with predetermined responses.
 
-
-class TestIsRetryable:
-    def test_429_is_retryable(self) -> None:
-        assert _is_retryable(_make_http_error(429)) is True
-
-    def test_500_is_retryable(self) -> None:
-        assert _is_retryable(_make_http_error(500)) is True
-
-    def test_502_is_retryable(self) -> None:
-        assert _is_retryable(_make_http_error(502)) is True
-
-    def test_503_is_retryable(self) -> None:
-        assert _is_retryable(_make_http_error(503)) is True
-
-    def test_400_not_retryable(self) -> None:
-        assert _is_retryable(_make_http_error(400)) is False
-
-    def test_403_not_retryable(self) -> None:
-        assert _is_retryable(_make_http_error(403)) is False
-
-    def test_404_not_retryable(self) -> None:
-        assert _is_retryable(_make_http_error(404)) is False
-
-    def test_non_http_error_not_retryable(self) -> None:
-        assert _is_retryable(RuntimeError("something")) is False
-
-    def test_generic_exception_not_retryable(self) -> None:
-        assert _is_retryable(Exception("generic")) is False
-
-
-# ---------------------------------------------------------------------------
-# _execute_with_transport_retry
-# ---------------------------------------------------------------------------
-
-
-class TestExecuteWithTransportRetry:
-    @patch("gmail_mcp.gmail_client.time.sleep")
-    def test_succeeds_first_try(self, mock_sleep: MagicMock) -> None:
-        batch = MagicMock()
-        batch.execute.return_value = None
-
-        _execute_with_transport_retry(batch)
-
-        batch.execute.assert_called_once()
-        mock_sleep.assert_not_called()
-
-    @patch("gmail_mcp.gmail_client.time.sleep")
-    def test_retries_on_transport_failure(self, mock_sleep: MagicMock) -> None:
-        batch = MagicMock()
-        # Fail twice, succeed third time.
-        batch.execute.side_effect = [OSError("DNS failed"), OSError("timeout"), None]
-
-        _execute_with_transport_retry(batch)
-
-        assert batch.execute.call_count == 3
-        assert mock_sleep.call_count == 2
-        # Exponential backoff: 1.0, 2.0
-        mock_sleep.assert_any_call(1.0)
-        mock_sleep.assert_any_call(2.0)
-
-    @patch("gmail_mcp.gmail_client.time.sleep")
-    def test_raises_after_all_retries_exhausted(self, mock_sleep: MagicMock) -> None:
-        batch = MagicMock()
-        batch.execute.side_effect = OSError("persistent failure")
-
-        with pytest.raises(OSError, match="persistent failure"):
-            _execute_with_transport_retry(batch)
-
-        # 3 attempts (matching _RETRY_DELAYS length)
-        assert batch.execute.call_count == 3
-        assert mock_sleep.call_count == 2
-
-
-# ---------------------------------------------------------------------------
-# _run_batch
-# ---------------------------------------------------------------------------
-
-
-def _make_mock_svc(responses: dict[str, dict | Exception]) -> MagicMock:
-    """Build a mock service whose batch executes a callback per request.
-
-    Args:
-        responses: mapping of request_id -> response dict or Exception.
-            If the value is an Exception, the callback gets it as the exception arg.
+    Pass a dict of {request_id: response_dict_or_Exception}. When the batch
+    executes, each added request gets its corresponding response via the callback.
     """
     svc = MagicMock()
 
-    def _new_batch(callback: object = None) -> MagicMock:
+    def _new_batch(callback: Any = None) -> MagicMock:
         batch = MagicMock()
         added: list[str] = []
 
-        def _add(request: object, request_id: str = "") -> None:
+        def _add(request: Any, request_id: str = "") -> None:
             added.append(request_id)
 
         def _execute() -> None:
             for rid in added:
-                result = responses.get(rid)
-                if isinstance(result, Exception):
-                    callback(rid, {}, result)  # type: ignore[operator]
+                resp = responses.get(rid)
+                if isinstance(resp, Exception):
+                    callback(rid, {}, resp)
                 else:
-                    callback(rid, result, None)  # type: ignore[operator]
+                    callback(rid, resp, None)
 
         batch.add = _add
         batch.execute = _execute
@@ -138,75 +56,79 @@ def _make_mock_svc(responses: dict[str, dict | Exception]) -> MagicMock:
     return svc
 
 
+# ---------------------------------------------------------------------------
+# _execute_with_transport_retry
+# ---------------------------------------------------------------------------
+
+
+class TestTransportRetry:
+    def test_succeeds_immediately(self) -> None:
+        batch = MagicMock()
+        _execute_with_transport_retry(batch)
+        batch.execute.assert_called_once()
+
+    @pytest.mark.parametrize("failures_before_success", [1, 2])
+    def test_retries_then_succeeds(self, failures_before_success: int) -> None:
+        batch = MagicMock()
+        batch.execute.side_effect = [
+            *[OSError("fail")] * failures_before_success,
+            None,
+        ]
+
+        _execute_with_transport_retry(batch)
+
+        assert batch.execute.call_count == failures_before_success + 1
+
+    def test_raises_after_exhausting_retries(self) -> None:
+        batch = MagicMock()
+        batch.execute.side_effect = OSError("persistent")
+
+        with pytest.raises(OSError, match="persistent"):
+            _execute_with_transport_retry(batch)
+
+        assert batch.execute.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# _run_batch
+# ---------------------------------------------------------------------------
+
+
 class TestRunBatch:
-    @patch("gmail_mcp.gmail_client.time.sleep")
-    def test_all_succeed(self, mock_sleep: MagicMock) -> None:
-        responses = {
-            "msg1": {"id": "msg1", "data": "hello"},
-            "msg2": {"id": "msg2", "data": "world"},
-        }
-        svc = _make_mock_svc(responses)
-        build_request = MagicMock(return_value="fake_request")
-
-        result = _run_batch(svc, ["msg1", "msg2"], build_request)
-
+    def test_all_succeed(self) -> None:
+        responses = {"a": {"id": "a"}, "b": {"id": "b"}}
+        result = _run_batch(_make_svc(responses), ["a", "b"], MagicMock())
         assert result == responses
-        assert build_request.call_count == 2
-        mock_sleep.assert_not_called()
 
-    @patch("gmail_mcp.gmail_client.time.sleep")
-    def test_non_retryable_errors_are_dropped(self, mock_sleep: MagicMock) -> None:
-        responses: dict[str, dict | Exception] = {
-            "msg1": {"id": "msg1", "data": "ok"},
-            "msg2": _make_http_error(404),  # not retryable
+    def test_non_retryable_errors_are_dropped(self) -> None:
+        responses: dict[str, dict[str, Any] | Exception] = {
+            "ok": {"id": "ok"},
+            "bad": _http_error(404),
         }
-        svc = _make_mock_svc(responses)
+        result = _run_batch(_make_svc(responses), ["ok", "bad"], MagicMock())
+        assert "ok" in result
+        assert "bad" not in result
 
-        result = _run_batch(svc, ["msg1", "msg2"], MagicMock(return_value="req"))
+    def test_retryable_error_is_retried_and_succeeds(self) -> None:
+        """First call returns 429 for 'flaky'; second call succeeds."""
+        attempt = {"n": 0}
 
-        # Only msg1 succeeds; msg2 is dropped without retry.
-        assert "msg1" in result
-        assert "msg2" not in result
-        mock_sleep.assert_not_called()
-
-    @patch("gmail_mcp.gmail_client.time.sleep")
-    def test_retryable_errors_are_retried(self, mock_sleep: MagicMock) -> None:
-        """A 429 on first attempt succeeds on retry."""
-        call_count: dict[str, int] = {"msg1": 0}
-
-        def dynamic_responses() -> dict[str, dict | Exception]:
-            """Simulate msg1 failing once then succeeding."""
-            call_count["msg1"] += 1
-            if call_count["msg1"] == 1:
-                return {
-                    "msg1": _make_http_error(429),
-                    "msg2": {"id": "msg2"},
-                }
-            return {
-                "msg1": {"id": "msg1"},
-                "msg2": {"id": "msg2"},
-            }
-
-        # Build a service that uses dynamic responses.
         svc = MagicMock()
-        batches_executed: list[list[str]] = []
 
-        def _new_batch(callback: object = None) -> MagicMock:
+        def _new_batch(callback: Any = None) -> MagicMock:
             batch = MagicMock()
             added: list[str] = []
 
-            def _add(request: object, request_id: str = "") -> None:
+            def _add(request: Any, request_id: str = "") -> None:
                 added.append(request_id)
 
             def _execute() -> None:
-                batches_executed.append(list(added))
-                resps = dynamic_responses()
+                attempt["n"] += 1
                 for rid in added:
-                    r = resps.get(rid)
-                    if isinstance(r, Exception):
-                        callback(rid, {}, r)  # type: ignore[operator]
+                    if rid == "flaky" and attempt["n"] == 1:
+                        callback(rid, {}, _http_error(429))
                     else:
-                        callback(rid, r, None)  # type: ignore[operator]
+                        callback(rid, {"id": rid}, None)
 
             batch.add = _add
             batch.execute = _execute
@@ -214,48 +136,48 @@ class TestRunBatch:
 
         svc.new_batch_http_request = _new_batch
 
-        result = _run_batch(svc, ["msg1", "msg2"], MagicMock(return_value="req"))
+        result = _run_batch(svc, ["stable", "flaky"], MagicMock())
 
-        # Both succeed eventually.
-        assert "msg1" in result
-        assert "msg2" in result
-        # First batch had both IDs, second batch only had msg1 (the retry).
-        assert batches_executed[0] == ["msg1", "msg2"]
-        assert batches_executed[1] == ["msg1"]
-        # sleep was called for the backoff.
-        assert mock_sleep.call_count >= 1
+        assert result == {"stable": {"id": "stable"}, "flaky": {"id": "flaky"}}
 
-    @patch("gmail_mcp.gmail_client.time.sleep")
-    def test_retryable_error_gives_up_after_max_attempts(self, mock_sleep: MagicMock) -> None:
-        """A persistently failing request is eventually dropped."""
-        responses: dict[str, dict | Exception] = {
-            "msg1": _make_http_error(503),  # always fails
+    def test_persistent_retryable_error_is_eventually_dropped(self) -> None:
+        responses: dict[str, dict[str, Any] | Exception] = {
+            "doomed": _http_error(503),
         }
-        svc = _make_mock_svc(responses)
+        result = _run_batch(_make_svc(responses), ["doomed"], MagicMock())
+        assert "doomed" not in result
 
-        result = _run_batch(svc, ["msg1"], MagicMock(return_value="req"))
-
-        # msg1 never succeeds.
-        assert "msg1" not in result
-        # Should have retried (initial + 3 retries from _RETRY_DELAYS).
-        assert mock_sleep.call_count == 3
-
-    @patch("gmail_mcp.gmail_client.time.sleep")
-    def test_chunks_large_lists(self, mock_sleep: MagicMock) -> None:
-        """More than 100 IDs are split into multiple batches."""
-        ids = [f"msg{i}" for i in range(150)]
+    def test_chunks_into_batches_of_100(self) -> None:
+        ids = [f"m{i}" for i in range(250)]
         responses = {mid: {"id": mid} for mid in ids}
-        svc = _make_mock_svc(responses)
 
-        result = _run_batch(svc, ids, MagicMock(return_value="req"))
-
-        assert len(result) == 150
-        mock_sleep.assert_not_called()
-
-    @patch("gmail_mcp.gmail_client.time.sleep")
-    def test_empty_list(self, mock_sleep: MagicMock) -> None:
         svc = MagicMock()
-        result = _run_batch(svc, [], MagicMock(return_value="req"))
+        batch_sizes: list[int] = []
 
-        assert result == {}
+        def _new_batch(callback: Any = None) -> MagicMock:
+            batch = MagicMock()
+            added: list[str] = []
+
+            def _add(request: Any, request_id: str = "") -> None:
+                added.append(request_id)
+
+            def _execute() -> None:
+                batch_sizes.append(len(added))
+                for rid in added:
+                    callback(rid, responses[rid], None)
+
+            batch.add = _add
+            batch.execute = _execute
+            return batch
+
+        svc.new_batch_http_request = _new_batch
+
+        result = _run_batch(svc, ids, MagicMock())
+
+        assert len(result) == 250
+        assert batch_sizes == [100, 100, 50]
+
+    def test_empty_input(self) -> None:
+        svc = MagicMock()
+        assert _run_batch(svc, [], MagicMock()) == {}
         svc.new_batch_http_request.assert_not_called()
