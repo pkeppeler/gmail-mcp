@@ -30,10 +30,32 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 
 
 def _is_retryable(exc: Exception) -> bool:
-    """Return True if an individual batch response error is worth retrying."""
+    """Check if an error is transient (429 rate limit, or 5xx server error)."""
     if isinstance(exc, HttpError):
         return exc.status_code in _RETRYABLE_STATUS_CODES  # pyright: ignore[reportUnknownMemberType]
     return False
+
+
+def _execute_with_transport_retry(batch: Any) -> None:
+    """Execute a batch HTTP call, retrying if the network itself fails.
+
+    This handles the case where the entire HTTP request can't be sent or
+    received — DNS failures, connection resets, timeouts. It does NOT
+    handle per-request errors (those come back in the callback).
+    """
+    for attempt, delay in enumerate(_RETRY_DELAYS):
+        try:
+            batch.execute()
+            return
+        except Exception as exc:
+            if attempt == len(_RETRY_DELAYS) - 1:
+                raise
+            log.warning(
+                "Batch HTTP call failed (attempt %d/%d), retrying in %.0fs: %s",
+                attempt + 1, len(_RETRY_DELAYS), delay, exc,
+            )
+            time.sleep(delay)
+    batch.execute()
 
 
 def _run_batch(
@@ -41,68 +63,81 @@ def _run_batch(
     request_ids: list[str],
     build_request: Any,
 ) -> dict[str, dict[str, Any]]:
-    """Execute requests in batches of 100 with two-layer retry.
+    """Send many API requests efficiently using Google's batch endpoint.
 
-    Layer 1: retries the entire HTTP call on transport failures (DNS, etc.).
-    Layer 2: re-submits individual requests that got retryable errors (429, 5xx).
+    Instead of making N individual HTTP calls, this packs up to 100 requests
+    into a single HTTP call. Google's server processes them and returns all
+    responses at once.
+
+    Retry behavior:
+        - If the network fails entirely (DNS, timeout): retries the whole batch.
+        - If specific requests fail with 429/5xx: re-submits just those requests
+          in a smaller follow-up batch, with exponential backoff.
+        - If a request fails with 400/403/404: logs it and moves on (not retryable).
 
     Args:
-        svc: the Gmail API service object (for new_batch_http_request).
-        request_ids: list of IDs to process.
-        build_request: callable(id) -> HttpRequest for each ID.
+        svc: Gmail API service object (provides new_batch_http_request()).
+        request_ids: IDs to process (e.g., message IDs).
+        build_request: a function that takes an ID and returns an HttpRequest.
+            Example: lambda mid: svc.users().messages().get(userId="me", id=mid)
 
     Returns:
-        dict mapping request_id -> response dict for successful requests.
+        Dict of {request_id: response_dict} for all requests that succeeded.
+        Failed requests are logged but not included in the result.
     """
-    results: dict[str, dict[str, Any]] = {}
+    successful: dict[str, dict[str, Any]] = {}
 
+    # Process in chunks of 100 (Gmail's batch size limit).
     for chunk_start in range(0, len(request_ids), _BATCH_SIZE):
         chunk = request_ids[chunk_start : chunk_start + _BATCH_SIZE]
-        pending = list(chunk)
+        ids_to_send = list(chunk)
 
+        # Attempt loop: first attempt sends all IDs in the chunk, subsequent
+        # attempts only re-send the ones that failed with retryable errors.
         for attempt, delay in enumerate([0.0, *_RETRY_DELAYS]):
             if attempt > 0:
                 time.sleep(delay)
-                log.info("Retrying %d failed requests (attempt %d)", len(pending), attempt + 1)
+                log.info("Retrying %d failed requests (attempt %d)", len(ids_to_send), attempt + 1)
 
-            failed: dict[str, Exception] = {}
+            # These dicts collect results from the callback below.
+            failed_this_round: dict[str, Exception] = {}
 
-            def _callback(
+            # Google's batch API calls this function once per request in the batch,
+            # after all responses have been received. Each call gets:
+            #   - request_id: the ID we assigned when adding to the batch
+            #   - response: the parsed response body (if successful)
+            #   - exception: an HttpError (if the request returned 4xx/5xx)
+            # Exactly one of response/exception will be set.
+            def _collect_response(
                 request_id: str,
                 response: dict[str, Any],
                 exception: Exception | None,
-                _failed: dict[str, Exception] = failed,
-                _results: dict[str, dict[str, Any]] = results,
+                _failed: dict[str, Exception] = failed_this_round,
+                _successful: dict[str, dict[str, Any]] = successful,
             ) -> None:
                 if exception is not None:
                     _failed[request_id] = exception
                 else:
-                    _results[request_id] = response
+                    _successful[request_id] = response
 
-            batch = svc.new_batch_http_request(callback=_callback)
-            for rid in pending:
+            # Build the batch: one request per ID.
+            batch = svc.new_batch_http_request(callback=_collect_response)
+            for rid in ids_to_send:
                 batch.add(build_request(rid), request_id=rid)
 
-            # Layer 1: retry transport failures.
-            for transport_attempt, transport_delay in enumerate(_RETRY_DELAYS):
-                try:
-                    batch.execute()
-                    break
-                except Exception as exc:
-                    if transport_attempt == len(_RETRY_DELAYS) - 1:
-                        raise
-                    log.warning("Batch transport failed (attempt %d), retrying in %.0fs: %s", transport_attempt + 1, transport_delay, exc)
-                    time.sleep(transport_delay)
+            # Send it (with transport-level retry for network failures).
+            _execute_with_transport_retry(batch)
 
-            # Layer 2: collect retryable per-request failures.
-            pending = [rid for rid, exc in failed.items() if _is_retryable(exc)]
-            for rid, exc in failed.items():
+            # Check which requests failed and whether they're worth retrying.
+            ids_to_send = [rid for rid, exc in failed_this_round.items() if _is_retryable(exc)]
+            for rid, exc in failed_this_round.items():
                 if not _is_retryable(exc):
                     log.warning("Non-retryable error for %s: %s", rid, exc)
-            if not pending:
+
+            if not ids_to_send:
                 break
 
-    return results
+    return successful
 
 
 # ---------------------------------------------------------------------------
