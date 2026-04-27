@@ -17,6 +17,8 @@ Environment variables (inline JSON — for remote/CI environments):
     (e.g. in Claude Code web sessions) without manually creating config files.
 """
 
+__all__ = ["get_credentials", "get_gmail_service", "SCOPES"]
+
 import json
 import logging
 import os
