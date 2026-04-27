@@ -1,1 +1,623 @@
-"""Thin wrapper around the Gmail API. Returns Pydantic models."""
+"""Thin wrapper around the Gmail API. Returns Pydantic models.
+
+GmailClient takes an authenticated ``Resource`` from ``auth.py`` and exposes
+methods that map 1:1 to Gmail API operations.  Every ``.execute()`` call uses
+``num_retries=3`` so transient 503s and rate-limit 429s are handled
+automatically with exponential backoff (built into googleapiclient).
+
+Nothing in this module imports tool-layer code.  Tool handlers import *this*.
+"""
+
+import base64
+import html as html_mod
+import logging
+import re
+import time
+from typing import Any
+
+from googleapiclient.discovery import Resource  # type: ignore[import-untyped]  # noqa: F401
+from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
+from pydantic import BaseModel, ConfigDict, Field
+
+log = logging.getLogger(__name__)
+
+# Every .execute() call passes this so the google-api-python-client retries
+# transient HTTP errors (429, 5xx) with built-in exponential backoff.
+_RETRIES = 3
+_BATCH_SIZE = 100
+_RETRY_DELAYS = [1.0, 2.0, 4.0]
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Check if an error is transient (429 rate limit, or 5xx server error)."""
+    if isinstance(exc, HttpError):
+        return exc.status_code in _RETRYABLE_STATUS_CODES  # pyright: ignore[reportUnknownMemberType]
+    return False
+
+
+def _execute_with_transport_retry(batch: Any) -> None:
+    """Execute a batch HTTP call, retrying if the network itself fails.
+
+    This handles the case where the entire HTTP request can't be sent or
+    received — DNS failures, connection resets, timeouts. It does NOT
+    handle per-request errors (those come back in the callback).
+    """
+    for attempt, delay in enumerate(_RETRY_DELAYS):
+        try:
+            batch.execute()
+            return
+        except Exception as exc:
+            if attempt == len(_RETRY_DELAYS) - 1:
+                raise
+            log.warning(
+                "Batch HTTP call failed (attempt %d/%d), retrying in %.0fs: %s",
+                attempt + 1, len(_RETRY_DELAYS), delay, exc,
+            )
+            time.sleep(delay)
+    batch.execute()
+
+
+def _run_batch(
+    svc: Any,
+    request_ids: list[str],
+    build_request: Any,
+) -> dict[str, dict[str, Any]]:
+    """Send many API requests efficiently using Google's batch endpoint.
+
+    Instead of making N individual HTTP calls, this packs up to 100 requests
+    into a single HTTP call. Google's server processes them and returns all
+    responses at once.
+
+    Retry behavior:
+        - If the network fails entirely (DNS, timeout): retries the whole batch.
+        - If specific requests fail with 429/5xx: re-submits just those requests
+          in a smaller follow-up batch, with exponential backoff.
+        - If a request fails with 400/403/404: logs it and moves on (not retryable).
+
+    Args:
+        svc: Gmail API service object (provides new_batch_http_request()).
+        request_ids: IDs to process (e.g., message IDs).
+        build_request: a function that takes an ID and returns an HttpRequest.
+            Example: lambda mid: svc.users().messages().get(userId="me", id=mid)
+
+    Returns:
+        Dict of {request_id: response_dict} for all requests that succeeded.
+        Failed requests are logged but not included in the result.
+    """
+    successful: dict[str, dict[str, Any]] = {}
+
+    # Process in chunks of 100 (Gmail's batch size limit).
+    for chunk_start in range(0, len(request_ids), _BATCH_SIZE):
+        chunk = request_ids[chunk_start : chunk_start + _BATCH_SIZE]
+        ids_to_send = list(chunk)
+
+        # Attempt loop: first attempt sends all IDs in the chunk, subsequent
+        # attempts only re-send the ones that failed with retryable errors.
+        for attempt, delay in enumerate([0.0, *_RETRY_DELAYS]):
+            if attempt > 0:
+                time.sleep(delay)
+                log.info("Retrying %d failed requests (attempt %d)", len(ids_to_send), attempt + 1)
+
+            # These dicts collect results from the callback below.
+            failed_this_round: dict[str, Exception] = {}
+
+            # Google's batch API calls this function once per request in the batch,
+            # after all responses have been received. Each call gets:
+            #   - request_id: the ID we assigned when adding to the batch
+            #   - response: the parsed response body (if successful)
+            #   - exception: an HttpError (if the request returned 4xx/5xx)
+            # Exactly one of response/exception will be set.
+            def _collect_response(
+                request_id: str,
+                response: dict[str, Any],
+                exception: Exception | None,
+                _failed: dict[str, Exception] = failed_this_round,
+                _successful: dict[str, dict[str, Any]] = successful,
+            ) -> None:
+                if exception is not None:
+                    _failed[request_id] = exception
+                else:
+                    _successful[request_id] = response
+
+            # Build the batch: one request per ID.
+            batch = svc.new_batch_http_request(callback=_collect_response)
+            for rid in ids_to_send:
+                batch.add(build_request(rid), request_id=rid)
+
+            # Send it (with transport-level retry for network failures).
+            _execute_with_transport_retry(batch)
+
+            # Check which requests failed and whether they're worth retrying.
+            ids_to_send = [rid for rid, exc in failed_this_round.items() if _is_retryable(exc)]
+            for rid, exc in failed_this_round.items():
+                if not _is_retryable(exc):
+                    log.warning("Non-retryable error for %s: %s", rid, exc)
+
+            if not ids_to_send:
+                break
+
+    return successful
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+
+class Label(BaseModel):
+    """A Gmail label."""
+
+    id: str
+    name: str
+    type: str = "user"
+
+
+class MessageSummary(BaseModel):
+    """Lightweight message returned by search/list — no body."""
+
+    id: str
+    thread_id: str
+    subject: str
+    sender: str  # "From" header
+    date: str
+    snippet: str
+    labels: list[str]  # human-readable label names
+
+
+class Message(BaseModel):
+    """Full message including decoded body text."""
+
+    id: str
+    thread_id: str
+    subject: str
+    sender: str
+    to: str
+    cc: str
+    date: str
+    labels: list[str]
+    body: str
+
+
+class FilterCriteria(BaseModel):
+    """Human-readable filter criteria."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str | None = Field(None, alias="from")
+    to: str | None = None
+    subject: str | None = None
+    query: str | None = None
+    has_attachment: bool | None = Field(None, alias="hasAttachment")
+    size: int | None = None
+    size_comparison: str | None = Field(None, alias="sizeComparison")
+
+
+class FilterAction(BaseModel):
+    """Human-readable filter action.
+
+    add_labels/remove_labels store human-readable names, not raw label IDs.
+    The alias fields (neverSpam, etc.) allow model_validate from API dicts.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    add_labels: list[str] = []
+    remove_labels: list[str] = []
+    archive: bool | None = None
+    mark_read: bool | None = None
+    star: bool | None = None
+    forward: str | None = None
+    delete: bool | None = None
+    never_spam: bool | None = Field(None, alias="neverSpam")
+    never_important: bool | None = Field(None, alias="neverMarkAsImportant")
+
+
+class Filter(BaseModel):
+    """A Gmail filter with human-readable criteria and actions."""
+
+    id: str
+    criteria: FilterCriteria
+    action: FilterAction
+
+
+class BatchResult(BaseModel):
+    """Result of a batch operation."""
+
+    messages_affected: int
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+
+class GmailClient:
+    """Thin wrapper around the Gmail API.
+
+    All methods return Pydantic models.  The constructor accepts the
+    ``Resource`` object returned by ``auth.get_gmail_service()``.
+    """
+
+    def __init__(self, service: Resource) -> None:
+        # Resource is dynamically built by googleapiclient — it has no real
+        # type stubs, so every chained call (.users().messages() etc.) would
+        # be Unknown.  Storing as Any makes attribute access return Any
+        # instead of Unknown, which pyright accepts cleanly.
+        self._svc: Any = service
+        # Label cache: populated on first call to list_labels().
+        self._label_cache: dict[str, Label] | None = None  # id -> Label
+        self._label_name_to_id: dict[str, str] | None = None  # name -> id
+
+    # ------------------------------------------------------------------
+    # Labels
+    # ------------------------------------------------------------------
+
+    def list_labels(self) -> list[Label]:
+        """List all labels and refresh the internal cache."""
+        resp: dict[str, Any] = (
+            self._svc.users()            .labels()
+            .list(userId="me")
+            .execute(num_retries=_RETRIES)
+        )
+        raw_labels: list[dict[str, Any]] = resp.get("labels", [])
+        labels = [Label.model_validate(l) for l in raw_labels]
+        # Rebuild caches.
+        self._label_cache = {lb.id: lb for lb in labels}
+        self._label_name_to_id = {lb.name: lb.id for lb in labels}
+        return labels
+
+    def resolve_label_id(self, name: str) -> str:
+        """Resolve a human-readable label name to its ID.
+
+        Rebuilds the cache on a miss (handles labels created after startup).
+        """
+        if self._label_name_to_id is None:
+            self.list_labels()
+        assert self._label_name_to_id is not None
+        lid = self._label_name_to_id.get(name)
+        if lid is not None:
+            return lid
+        # Cache miss — rebuild and retry once.
+        self.list_labels()
+        assert self._label_name_to_id is not None
+        lid = self._label_name_to_id.get(name)
+        if lid is None:
+            raise ValueError(f"Unknown label: {name!r}")
+        return lid
+
+    def resolve_label_name(self, label_id: str) -> str:
+        """Resolve a label ID to its human-readable name."""
+        if self._label_cache is None:
+            self.list_labels()
+        assert self._label_cache is not None
+        label = self._label_cache.get(label_id)
+        if label is not None:
+            return label.name
+        # Cache miss — rebuild.
+        self.list_labels()
+        assert self._label_cache is not None
+        label = self._label_cache.get(label_id)
+        return label.name if label is not None else label_id
+
+    # ------------------------------------------------------------------
+    # Messages — search / read
+    # ------------------------------------------------------------------
+
+    def search_messages(
+        self, query: str, max_results: int = 20
+    ) -> list[MessageSummary]:
+        """Search for messages matching a Gmail query string.
+
+        Returns lightweight summaries (no body).  Paginates internally up to
+        *max_results*.
+        """
+        message_ids: list[str] = []
+        page_token: str | None = None
+
+        while len(message_ids) < max_results:
+            kwargs: dict[str, Any] = {
+                "userId": "me",
+                "q": query,
+                "maxResults": min(max_results - len(message_ids), 500),
+            }
+            if page_token is not None:
+                kwargs["pageToken"] = page_token
+
+            resp: dict[str, Any] = (
+                self._svc.users()                .messages()
+                .list(**kwargs)
+                .execute(num_retries=_RETRIES)
+            )
+            for m in resp.get("messages", []):
+                message_ids.append(m["id"])
+            page_token = resp.get("nextPageToken")
+            if page_token is None:
+                break
+
+        # Fetch metadata in batches of 100 with per-request retry.
+        raw_messages = _run_batch(
+            self._svc,
+            message_ids,
+            lambda mid: self._svc.users().messages().get(  # pyright: ignore[reportUnknownLambdaType]
+                userId="me",
+                id=mid,
+                format="metadata",
+                metadataHeaders=["Subject", "From", "Date"],
+            ),
+        )
+
+        # Build summaries in the original ID order.
+        summaries: list[MessageSummary] = []
+        for mid in message_ids:
+            raw = raw_messages.get(mid)
+            if raw is None:
+                continue
+            headers = _headers_dict(raw)
+            label_ids: list[str] = raw.get("labelIds", [])
+            summaries.append(
+                MessageSummary(
+                    id=raw["id"],
+                    thread_id=raw["threadId"],
+                    subject=headers.get("Subject", "(no subject)"),
+                    sender=headers.get("From", ""),
+                    date=headers.get("Date", ""),
+                    snippet=raw.get("snippet", ""),
+                    labels=[self.resolve_label_name(lid) for lid in label_ids],
+                )
+            )
+        return summaries
+
+    def get_message(self, message_id: str) -> Message:
+        """Fetch a single message with full headers and decoded body text."""
+        raw: dict[str, Any] = (
+            self._svc.users()            .messages()
+            .get(userId="me", id=message_id, format="full")
+            .execute(num_retries=_RETRIES)
+        )
+        headers = _headers_dict(raw)
+        label_ids: list[str] = raw.get("labelIds", [])
+        body = _extract_body(raw.get("payload", {}))
+        return Message(
+            id=raw["id"],
+            thread_id=raw["threadId"],
+            subject=headers.get("Subject", "(no subject)"),
+            sender=headers.get("From", ""),
+            to=headers.get("To", ""),
+            cc=headers.get("Cc", ""),
+            date=headers.get("Date", ""),
+            labels=[self.resolve_label_name(lid) for lid in label_ids],
+            body=body,
+        )
+
+    # ------------------------------------------------------------------
+    # Messages — modify / archive / trash / delete
+    # ------------------------------------------------------------------
+
+    def modify_labels(
+        self,
+        message_id: str,
+        add_labels: list[str] | None = None,
+        remove_labels: list[str] | None = None,
+    ) -> None:
+        """Add and/or remove labels on a single message.
+
+        Labels are specified by human-readable name.
+        """
+        body: dict[str, list[str]] = {}
+        if add_labels:
+            body["addLabelIds"] = [self.resolve_label_id(n) for n in add_labels]
+        if remove_labels:
+            body["removeLabelIds"] = [
+                self.resolve_label_id(n) for n in remove_labels
+            ]
+        self._svc.users().messages().modify(            userId="me", id=message_id, body=body
+        ).execute(num_retries=_RETRIES)
+
+    def archive_message(self, message_id: str) -> None:
+        """Archive a message (remove the INBOX label)."""
+        self.modify_labels(message_id, remove_labels=["INBOX"])
+
+    def trash_message(self, message_id: str) -> None:
+        """Move a message to the trash (recoverable)."""
+        self._svc.users().messages().trash(            userId="me", id=message_id
+        ).execute(num_retries=_RETRIES)
+
+    def delete_message(self, message_id: str) -> None:
+        """Permanently delete a message. This cannot be undone."""
+        self._svc.users().messages().delete(            userId="me", id=message_id
+        ).execute(num_retries=_RETRIES)
+
+    # ------------------------------------------------------------------
+    # Messages — batch modify
+    # ------------------------------------------------------------------
+
+    def batch_modify_labels(
+        self,
+        message_ids: list[str],
+        add_labels: list[str] | None = None,
+        remove_labels: list[str] | None = None,
+    ) -> None:
+        """Add/remove labels on a batch of messages (max 1000 per call)."""
+        body: dict[str, Any] = {"ids": message_ids}
+        if add_labels:
+            body["addLabelIds"] = [self.resolve_label_id(n) for n in add_labels]
+        if remove_labels:
+            body["removeLabelIds"] = [
+                self.resolve_label_id(n) for n in remove_labels
+            ]
+        self._svc.users().messages().batchModify(            userId="me", body=body
+        ).execute(num_retries=_RETRIES)
+
+    # ------------------------------------------------------------------
+    # Filters
+    # ------------------------------------------------------------------
+
+    def list_filters(self) -> list[Filter]:
+        """List all Gmail filters with human-readable criteria and actions."""
+        resp: dict[str, Any] = (
+            self._svc.users()            .settings()
+            .filters()
+            .list(userId="me")
+            .execute(num_retries=_RETRIES)
+        )
+        raw_filters: list[dict[str, Any]] = resp.get("filter", [])
+        return [self._parse_filter(f) for f in raw_filters]
+
+    def create_filter(
+        self, criteria: FilterCriteria, action: FilterAction
+    ) -> Filter:
+        """Create a new Gmail filter. Returns the created filter."""
+        body: dict[str, Any] = {
+            "criteria": self._criteria_to_api(criteria),
+            "action": self._action_to_api(action),
+        }
+        resp: dict[str, Any] = (
+            self._svc.users()            .settings()
+            .filters()
+            .create(userId="me", body=body)
+            .execute(num_retries=_RETRIES)
+        )
+        return self._parse_filter(resp)
+
+    def delete_filter(self, filter_id: str) -> None:
+        """Delete a Gmail filter by ID."""
+        self._svc.users().settings().filters().delete(            userId="me", id=filter_id
+        ).execute(num_retries=_RETRIES)
+
+    # ------------------------------------------------------------------
+    # Filter helpers
+    # ------------------------------------------------------------------
+
+    def _parse_filter(self, raw: dict[str, Any]) -> Filter:
+        """Convert a raw API filter dict into a Filter model."""
+        criteria = FilterCriteria.model_validate(raw.get("criteria", {}))
+
+        raw_action: dict[str, Any] = raw.get("action", {})
+        add_label_ids: list[str] = raw_action.get("addLabelIds", [])
+        remove_label_ids: list[str] = raw_action.get("removeLabelIds", [])
+
+        action = FilterAction.model_validate(
+            {
+                **raw_action,
+                "add_labels": [self.resolve_label_name(lid) for lid in add_label_ids],
+                "remove_labels": [self.resolve_label_name(lid) for lid in remove_label_ids],
+                "archive": "INBOX" in remove_label_ids,
+                "mark_read": "UNREAD" in remove_label_ids,
+                "star": "STARRED" in add_label_ids,
+            }
+        )
+
+        return Filter(id=raw["id"], criteria=criteria, action=action)
+
+    def _criteria_to_api(self, c: FilterCriteria) -> dict[str, Any]:
+        """Convert FilterCriteria to the Gmail API format."""
+        return c.model_dump(by_alias=True, exclude_none=True)
+
+    def _action_to_api(self, a: FilterAction) -> dict[str, Any]:
+        """Convert FilterAction to the Gmail API format."""
+        # Scalar fields (forward, neverSpam, neverMarkAsImportant) via model_dump.
+        d = a.model_dump(
+            by_alias=True,
+            exclude_none=True,
+            exclude={"add_labels", "remove_labels", "archive", "mark_read", "star", "delete"},
+        )
+
+        # Label fields need ID resolution + special-label merging.
+        add_ids: list[str] = [self.resolve_label_id(n) for n in a.add_labels]
+        remove_ids: list[str] = [self.resolve_label_id(n) for n in a.remove_labels]
+        if a.star:
+            add_ids.append("STARRED")
+        if a.archive:
+            remove_ids.append("INBOX")
+        if a.mark_read:
+            remove_ids.append("UNREAD")
+
+        if add_ids:
+            d["addLabelIds"] = add_ids
+        if remove_ids:
+            d["removeLabelIds"] = remove_ids
+        return d
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _headers_dict(raw_message: dict[str, Any]) -> dict[str, str]:
+    """Extract a {name: value} dict from a raw message's payload headers."""
+    headers: list[dict[str, str]] = (
+        raw_message.get("payload", {}).get("headers", [])
+    )
+    return {h["name"]: h["value"] for h in headers}
+
+
+def _extract_body(payload: dict[str, Any]) -> str:
+    """Recursively walk a MIME payload and return the best body text.
+
+    Preference order:
+        1. text/plain
+        2. text/html (with tags stripped)
+
+    Handles nested multipart/mixed > multipart/alternative > leaf parts.
+    """
+    mime_type: str = payload.get("mimeType", "")
+
+    # Leaf node — decode and return.
+    if not mime_type.startswith("multipart/"):
+        data: str = payload.get("body", {}).get("data", "")
+        if not data:
+            return ""
+        decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
+        if mime_type == "text/plain":
+            return decoded
+        if mime_type == "text/html":
+            return _strip_html(decoded)
+        # Other types (images, PDFs, etc.) — skip.
+        return ""
+
+    # Multipart node — recurse into parts.
+    parts: list[dict[str, Any]] = payload.get("parts", [])
+
+    # For multipart/alternative, prefer text/plain over text/html.
+    if mime_type == "multipart/alternative":
+        plain = ""
+        html = ""
+        for part in parts:
+            child_mime: str = part.get("mimeType", "")
+            if child_mime == "text/plain" or child_mime.startswith("multipart/"):
+                result = _extract_body(part)
+                if result and not plain:
+                    plain = result
+            elif child_mime == "text/html":
+                result = _extract_body(part)
+                if result and not html:
+                    html = result
+        return plain or html
+
+    # For multipart/mixed, multipart/related, etc. — concatenate text parts.
+    texts: list[str] = []
+    for part in parts:
+        result = _extract_body(part)
+        if result:
+            texts.append(result)
+    return "\n".join(texts)
+
+
+def _strip_html(html: str) -> str:
+    """Strip HTML tags and decode entities, returning plain text."""
+    # Remove <style> and <script> blocks entirely.
+    text = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Replace <br> and block-level tags with newlines.
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</(p|div|tr|li|h[1-6])>", "\n", text, flags=re.IGNORECASE)
+    # Strip remaining tags.
+    text = re.sub(r"<[^>]+>", "", text)
+    # Decode HTML entities.
+    text = html_mod.unescape(text)
+    # Collapse excessive whitespace but keep single newlines.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()

@@ -163,3 +163,9 @@ All bulk tools paginate internally. Gmail batch limit is 100 messages per reques
 - Keep JSON-RPC protocol mechanics visible in `server.py`. No meta-programming or magic dispatch.
 - `gmail_client.py` returns clean Pydantic models. Tools should not import `googleapiclient` directly.
 - Tool handlers are plain functions that take a Pydantic model and return a Pydantic model.
+
+## Supply Chain Security
+
+- **Pin GitHub Actions by SHA, not tag.** Tags are mutable — a compromised repo can move a tag to point at malicious code. SHAs are immutable. Always use the full 40-character commit SHA with a version comment: `uses: actions/checkout@<sha> # v4.3.1`
+- **Dependabot keeps SHAs current.** `.github/dependabot.yml` is configured to open PRs weekly when new versions of GitHub Actions are released, updating the SHA pins automatically.
+- **Never use `@main`, `@master`, or `@latest` for actions.** These float and can change without notice.
